@@ -30,10 +30,13 @@ Checks for each instance directory:
   - CSV must have at least one data row. By default, we verify `Problem` == <instance>.
   - Basic type checks for some numeric/count columns.
   - Objective time series JSON structure: list of runs; each run is a list of objects with keys Time and Incumbent.
+  - Automatically runs the per-problem solution checker (if available) for each solution.
+    Pass --no-check to disable this.
   - (Optional) run a solution checker for each solution via a user-provided command template.
 
 Usage:
   python validate_submission.py SUBMISSION_ROOT
+    [--no-check]                         # disable automatic per-problem solution checker
     [--checker-cmd '...{solution}...']   # command template with placeholders
     [--instance-pattern 'glob*']         # only check matching instance dir names
     [--fail-on-checker]                  # mark instance invalid if checker fails/returns nonzero
@@ -44,6 +47,16 @@ Usage:
   Placeholders for --checker-cmd: {submission_root} {instance_dir} {instance} {solution}
 
 Exit code is nonzero if any instance fails validation.
+
+Automatic per-problem checkers (built via `cargo build --release` in <problem>/check/):
+  01-marketsplit : check_marketsplit  <instance>.dat <solution>
+  02-labs        : check_labs         <N> <solution>
+  03-birkhoff    : check_birkhoff     <instance>.json <solution>
+  04-steiner     : check_steiner      --arcs arcs.dat --terms terms.dat --sol <solution>
+  07-independent : check_stableset    <instance>.gph <solution>
+  08-network     : check_network      <size> demand.txt <solution>
+  09-routing     : check_cvrp         <instance>.vrp <solution>
+  10-topology    : check_topology     <nodes> <degree> <diameter> <solution>
 """
 
 from __future__ import annotations
@@ -60,6 +73,7 @@ from typing import Dict, List, Optional, Tuple, Iterable
 import subprocess
 import fnmatch
 import gzip
+import os
 
 REQUIRED_COLUMNS: List[str] = [
     "Problem","Submitter","Date","Reference","Best Objective Value","Optimality Bound","Modeling Approach",
@@ -339,6 +353,199 @@ def generate_readme_from_csv(instance: str, inst_dir: Path, rows: List[Dict[str,
     report.info(f"README.md generated from CSV ({readme_path.name}).")
 
 
+# ---------------------------------------------------------------------------
+# Auto per-problem checker
+# ---------------------------------------------------------------------------
+
+def _detect_problem_and_roots(
+    submission_root: Path,
+) -> Tuple[Optional[str], Optional[Path], Optional[Path]]:
+    """Detect (problem_dir_name, check_dir, qoblib_root) from the submission path.
+
+    Expected layout: <qoblib_root>/<problem_dir>/submissions/<submission_name>/
+    Returns (None, None, None) when the layout doesn't match or no check/ dir exists.
+    """
+    try:
+        problem_dir = submission_root.resolve().parent.parent
+        qoblib_root = problem_dir.parent
+        check_dir = problem_dir / "check"
+        if not check_dir.is_dir():
+            return None, None, None
+        return problem_dir.name, check_dir, qoblib_root
+    except Exception:
+        return None, None, None
+
+
+def _ensure_checker_built(check_dir: Path, binary_name: str) -> Optional[Path]:
+    """Return the path to the checker binary, building it with cargo if needed."""
+    binary_path = check_dir / "target" / "release" / binary_name
+    if binary_path.exists():
+        return binary_path
+    print(f"  Building checker '{binary_name}' in {check_dir} ...", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=str(check_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and binary_path.exists():
+            return binary_path
+        print(
+            f"  WARNING: cargo build failed (rc={result.returncode}):\n"
+            + textwrap.indent(result.stderr[:600], "    "),
+            file=sys.stderr,
+        )
+    except FileNotFoundError:
+        print("  WARNING: 'cargo' not found; cannot build checker.", file=sys.stderr)
+    return None
+
+
+def _read_topology_diameter(solution_path: Path) -> int:
+    """Read the diameter from the first 5 comment lines of a topology .gph file."""
+    try:
+        with solution_path.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 5:
+                    break
+                m = re.search(r"(?i)^c[^\d]*(diameter)[^\d]*(\d+)", line)
+                if m:
+                    return int(m.group(2))
+    except OSError:
+        pass
+    return 999999
+
+
+def _build_auto_checker_cmd(
+    problem_name: str,
+    check_dir: Path,
+    qoblib_root: Path,
+    instance: str,
+    solution: Path,
+) -> Optional[List[str]]:
+    """Construct a checker command list for the given problem/instance/solution.
+
+    Returns None when no checker applies (unknown problem or build failure).
+    """
+    prob = problem_dir = problem_name  # alias for readability
+    instances_dir = qoblib_root / problem_name / "instances"
+
+    if prob.startswith("01-"):
+        binary = _ensure_checker_built(check_dir, "check_marketsplit")
+        if not binary:
+            return None
+        return [str(binary), str(instances_dir / f"{instance}.dat"), str(solution)]
+
+    if prob.startswith("02-"):
+        binary = _ensure_checker_built(check_dir, "check_labs")
+        if not binary:
+            return None
+        m = re.search(r"(\d+)", instance)
+        num = m.group(1) if m else "0"
+        return [str(binary), num, str(solution)]
+
+    if prob.startswith("03-"):
+        binary = _ensure_checker_built(check_dir, "check_birkhoff")
+        if not binary:
+            return None
+        # Instance name format: B{n}_{k}_{idx}
+        # k == n  → sparse file qbench_{n:02d}_sparse.json
+        # k == n² → dense  file qbench_{n:02d}_dense.json
+        m = re.match(r"B(\d+)_(\d+)_\d+", instance, re.IGNORECASE)
+        if not m:
+            return None
+        n, k = int(m.group(1)), int(m.group(2))
+        density = "dense" if k == n * n else "sparse"
+        instance_file = instances_dir / f"qbench_{n:02d}_{density}.json"
+        if not instance_file.exists():
+            return None
+        return [str(binary), str(instance_file), str(solution)]
+
+    if prob.startswith("04-"):
+        binary = _ensure_checker_built(check_dir, "check_steiner")
+        if not binary:
+            return None
+        arcs = instances_dir / instance / "arcs.dat"
+        terms = instances_dir / instance / "terms.dat"
+        return [str(binary), "--arcs", str(arcs), "--terms", str(terms), "--sol", str(solution)]
+
+    if prob.startswith("07-"):
+        binary = _ensure_checker_built(check_dir, "check_stableset")
+        if not binary:
+            return None
+        return [str(binary), str(instances_dir / f"{instance}.gph"), str(solution)]
+
+    if prob.startswith("08-"):
+        binary = _ensure_checker_built(check_dir, "check_network")
+        if not binary:
+            return None
+        m = re.search(r"network(\d+)", instance, re.IGNORECASE)
+        size = str(int(m.group(1))) if m else "0"
+        demand_file = instances_dir / "demand.txt"
+        return [str(binary), size, str(demand_file), str(solution)]
+
+    if prob.startswith("09-"):
+        binary = _ensure_checker_built(check_dir, "check_cvrp")
+        if not binary:
+            return None
+        return [str(binary), str(instances_dir / f"{instance}.vrp"), str(solution)]
+
+    if prob.startswith("10-"):
+        binary = _ensure_checker_built(check_dir, "check_topology")
+        if not binary:
+            return None
+        m = re.search(r"topology_(\d+)_(\d+)", instance, re.IGNORECASE)
+        if not m:
+            return None
+        nodes, degree = m.group(1), m.group(2)
+        diameter = str(_read_topology_diameter(solution))
+        return [str(binary), nodes, degree, diameter, str(solution)]
+
+    return None
+
+
+def run_auto_checker_on_solutions(
+    problem_name: str,
+    check_dir: Path,
+    qoblib_root: Path,
+    instance: str,
+    solutions: List[Path],
+    report: InstanceReport,
+) -> None:
+    """Run the auto-detected per-problem checker on each solution."""
+    warned = False
+    for sol in solutions:
+        cmd = _build_auto_checker_cmd(problem_name, check_dir, qoblib_root, instance, sol)
+        if cmd is None:
+            if not warned:
+                report.warn(f"No auto-checker available for problem '{problem_name}'.")
+                warned = True
+            continue
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            checker_result = CheckerResult(
+                solution_path=sol,
+                returncode=proc.returncode,
+                stdout=proc.stdout.strip(),
+                stderr=proc.stderr.strip(),
+            )
+            report.checker_results.append(checker_result)
+            if proc.returncode == 0:
+                report.info(f"Checker ran successfully for solution {sol.name}.")
+        except Exception as e:
+            report.fail(f"Auto-checker execution failed for {sol.name}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Manual template checker (original)
+# ---------------------------------------------------------------------------
+
 def run_checker_on_solutions(
     checker_cmd_tpl: str,
     submission_root: Path,
@@ -363,12 +570,15 @@ def run_checker_on_solutions(
                 text=True,
                 check=False,
             )
-            report.checker_results.append(CheckerResult(
+            checker_result = CheckerResult(
                 solution_path=sol,
                 returncode=proc.returncode,
                 stdout=proc.stdout.strip(),
                 stderr=proc.stderr.strip(),
-            ))
+            )
+            report.checker_results.append(checker_result)
+            if proc.returncode == 0:
+                report.info(f"Checker ran successfully for solution {sol.name}.")
         except Exception as e:
             report.fail(f"Checker execution failed for {sol.name}: {e}")
 
@@ -389,11 +599,11 @@ def print_report(reports: List[InstanceReport], quiet: bool=False) -> None:
             print(msg)
         for w in r.warnings:
             print(w)
-        if r.checker_results:
+        failed_checks = [cr for cr in r.checker_results if cr.returncode != 0]
+        if failed_checks:
             print("Checker results:")
-            for cr in r.checker_results:
-                status = "OK" if cr.returncode == 0 else f"FAIL (rc={cr.returncode})"
-                print(f"  - {cr.solution_path.name}: {status}")
+            for cr in failed_checks:
+                print(f"  - {cr.solution_path.name}: FAIL (rc={cr.returncode})")
                 if cr.stdout:
                     print(textwrap.indent(cr.stdout, prefix="      stdout: "))
                 if cr.stderr:
@@ -438,11 +648,26 @@ def validate_instance(
         if not readme_path.exists():
             report.info("README.md not present (optional).")
 
-    # 5) Run checker if requested
+    # 5) Auto per-problem checker (default; disabled by --no-check)
+    if not args.no_check and solutions:
+        problem_name, check_dir, qoblib_root = _detect_problem_and_roots(submission_root)
+        if problem_name and check_dir:
+            auto_start = len(report.checker_results)
+            run_auto_checker_on_solutions(
+                problem_name, check_dir, qoblib_root, instance, solutions, report
+            )
+            # Auto-checker always fails the submission when the solution is incorrect
+            for cr in report.checker_results[auto_start:]:
+                if cr.returncode != 0:
+                    report.fail(f"Checker failed for solution {cr.solution_path.name} with return code {cr.returncode}.")
+        # If layout unrecognised, silently skip (no checker available)
+
+    # 6) Manual template checker if --checker-cmd provided
     if args.checker_cmd and solutions:
+        manual_start = len(report.checker_results)
         run_checker_on_solutions(args.checker_cmd, submission_root, inst_dir, instance, solutions, report)
         if args.fail_on_checker:
-            for cr in report.checker_results:
+            for cr in report.checker_results[manual_start:]:
                 if cr.returncode != 0:
                     report.fail(f"Checker failed for solution {cr.solution_path.name} with return code {cr.returncode}.")
 
@@ -452,6 +677,8 @@ def validate_instance(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate benchmarking-library submission.")
     parser.add_argument("submission_root", type=Path, help="Path to submission root directory.")
+    parser.add_argument("--no-check", action="store_true",
+                        help="Disable the automatic per-problem solution checker.")
     parser.add_argument("--checker-cmd", type=str, default=None,
                         help=("Command template to run a solution checker for each solution. "
                               "Placeholders: {submission_root} {instance_dir} {instance} {solution}"))
